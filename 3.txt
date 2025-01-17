@@ -1,0 +1,206 @@
+// src/store/websocketStore.ts
+import { create } from 'zustand'
+import { Client, Frame, StompSubscription } from '@stomp/stompjs'
+import SockJS from 'sockjs-client'
+import { MessageResponse, MessageRequest } from '@/types/chat'
+
+interface WebSocketStore {
+  client: Client | null
+  connected: boolean
+  subscriptions: Map<string, StompSubscription>
+  connectionError: string | null
+  connect: (token: string) => void
+  disconnect: () => void
+  sendPrivateMessage: (message: MessageRequest) => void
+  sendGroupMessage: (message: MessageRequest) => void
+  subscribeToConversation: (conversationId: string, callback: (message: MessageResponse) => void) => () => void
+  retryCount: number
+}
+
+const WEBSOCKET_URL = process.env.NEXT_PUBLIC_WEBSOCKET_URL || 'http://localhost:8080/ws'
+const RECONNECT_DELAY = 5000
+const MAX_RETRIES = 5
+
+export const useWebSocketStore = create<WebSocketStore>((set, get) => ({
+  client: null,
+  connected: false,
+  subscriptions: new Map(),
+  connectionError: null,
+  retryCount: 0,
+
+  connect: (token: string) => {
+    const { client } = get()
+    
+    if (client) {
+      client.deactivate()
+    }
+
+    const newClient = new Client({
+      webSocketFactory: () => new SockJS(WEBSOCKET_URL),
+      connectHeaders: {
+        Authorization: `Bearer ${token}`
+      },
+      debug: (str) => {
+        console.debug('STOMP: ' + str)
+      },
+      reconnectDelay: RECONNECT_DELAY,
+      heartbeatIncoming: 10000,
+      heartbeatOutgoing: 10000,
+
+      onConnect: () => {
+        set({ connected: true, connectionError: null, retryCount: 0 })
+        console.log('WebSocket Connected')
+      },
+
+      onDisconnect: () => {
+        set({ connected: false })
+        console.log('WebSocket Disconnected')
+      },
+
+      onStompError: (frame: Frame) => {
+        const retryCount = get().retryCount
+        if (retryCount < MAX_RETRIES) {
+          set({ retryCount: retryCount + 1 })
+          setTimeout(() => get().connect(token), RECONNECT_DELAY)
+        } else {
+          set({ 
+            connectionError: `Connection error: ${frame.headers['message']}`,
+            connected: false 
+          })
+        }
+      }
+    })
+
+    newClient.activate()
+    set({ client: newClient })
+  },
+
+  disconnect: () => {
+    const { client } = get()
+    if (client) {
+      client.deactivate()
+      set({ client: null, connected: false, subscriptions: new Map() })
+    }
+  },
+
+  sendPrivateMessage: (message: MessageRequest) => {
+    const { client, connected } = get()
+    if (!client || !connected) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    client.publish({
+      destination: '/app/chat.sendPrivateMessage',
+      body: JSON.stringify(message)
+    })
+  },
+
+  sendGroupMessage: (message: MessageRequest) => {
+    const { client, connected } = get()
+    if (!client || !connected) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    client.publish({
+      destination: '/app/chat.sendGroupMessage',
+      body: JSON.stringify(message)
+    })
+  },
+
+  subscribeToConversation: (conversationId: string, callback: (message: MessageResponse) => void) => {
+    const { client, subscriptions } = get()
+    if (!client) {
+      console.error('WebSocket not connected')
+      return () => {}
+    }
+
+    // Determine if this is a private or group conversation
+    const destination = conversationId.startsWith('private') 
+      ? `/queue/chat/${conversationId}`
+      : `/topic/chat/${conversationId}`
+
+    // Unsubscribe from existing subscription if any
+    const existingSub = subscriptions.get(conversationId)
+    if (existingSub) {
+      existingSub.unsubscribe()
+    }
+
+    // Create new subscription
+    const subscription = client.subscribe(destination, (message) => {
+      try {
+        const parsedMessage = JSON.parse(message.body) as MessageResponse
+        callback(parsedMessage)
+      } catch (error) {
+        console.error('Error parsing message:', error)
+      }
+    })
+
+    // Store the subscription
+    const newSubscriptions = new Map(subscriptions)
+    newSubscriptions.set(conversationId, subscription)
+    set({ subscriptions: newSubscriptions })
+
+    // Return unsubscribe function
+    return () => {
+      subscription.unsubscribe()
+      const currentSubs = get().subscriptions
+      currentSubs.delete(conversationId)
+      set({ subscriptions: currentSubs })
+    }
+  }
+}))
+
+// src/hooks/useWebSocket.ts
+import { useEffect } from 'react'
+import { useWebSocketStore } from '@/store/websocketStore'
+import { useAuth } from '@/hooks/useAuth' // Assuming you have an auth hook
+
+export const useWebSocket = () => {
+  const { token } = useAuth()
+  const { connect, disconnect, connected, connectionError } = useWebSocketStore()
+
+  useEffect(() => {
+    if (token && !connected) {
+      connect(token)
+    }
+
+    return () => {
+      disconnect()
+    }
+  }, [token])
+
+  return {
+    connected,
+    connectionError
+  }
+}
+
+// src/hooks/useChat.ts
+import { useCallback } from 'react'
+import { useWebSocketStore } from '@/store/websocketStore'
+import { MessageRequest, MessageResponse } from '@/types/chat'
+
+export const useChat = (conversationId: string) => {
+  const { 
+    sendPrivateMessage, 
+    sendGroupMessage, 
+    subscribeToConversation,
+    connected 
+  } = useWebSocketStore()
+
+  const sendMessage = useCallback((message: MessageRequest) => {
+    if (conversationId.startsWith('private')) {
+      sendPrivateMessage(message)
+    } else {
+      sendGroupMessage(message)
+    }
+  }, [conversationId, sendPrivateMessage, sendGroupMessage])
+
+  return {
+    sendMessage,
+    subscribeToConversation,
+    connected
+  }
+}
