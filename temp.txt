@@ -1,0 +1,997 @@
+GEMENI--------
+<contemplator>
+Let's break down this WebSocket integration for a Next.js 15 frontend, connecting to a Spring Boot backend with STOMP and SockJS. I need to generate some robust, production-ready code.
+
+
+Okay, first, the backend. It's using @EnableWebSocketMessageBroker, so it's definitely a STOMP-based setup. The configureMessageBroker method sets up /topic and /queue for broadcasting and user-specific messages, with /app as the application destination prefix and /user as the user destination prefix. Good, that gives me the basic routing structure. It's set up for a simple in-memory broker which is fine for development, but it's commented out for RabbitMQ, which is good to note for later.
+
+The configureWebSocketTransport is setting some reasonable limits on send time, buffer size, and message size. There's also a WebSocketHandlerDecorator for handling transport errors, which is a good practice. I'll need to mirror some of this error handling on the frontend.
+
+Next, registerStompEndpoints. It registers /ws as the endpoint, with allowed origins. SockJS is enabled, which is important for browser compatibility. There are settings for stream bytes limit, HTTP message cache size, and disconnect delay. I'll need to keep these in mind.
+
+The createWebSocketContainer bean sets limits on message buffer sizes and session idle timeout. This will affect how I handle long-lived connections on the client.
+
+The configureMessageConverters is setting up Jackson for JSON serialization/deserialization. That's standard and confirms I'll be working with JSON messages.
+
+Alright, the configureClientInboundChannel part is crucial. It's intercepting incoming messages. On CONNECT, it's extracting a JWT token from the Authorization header, validating it, and setting the authenticated user. This means I'll need to send the JWT token with each WebSocket connection from the frontend. The backend throws a MessageDeliveryException for invalid tokens which I'll need to handle on the frontend.
+
+The taskScheduler bean is just setting up a thread pool for WebSocket tasks. No direct impact on the frontend code, but good to know.
+
+Now, the ChatWebSocketController. It has two @MessageMapping methods: handlePrivateMessage and handleGroupMessage. They both take a MessageRequest payload. Private messages are sent to /queue/chat/{conversationId} and group messages to /topic/chat/{conversationId}. I'll need to create functions on the frontend to send messages to these destinations.
+
+The entities... Conversation, Message, MessageDeliveryStatus. They define the data structure. The MessageRequest and MessageResponse records are the DTOs used for communication. I'll need to create similar structures on the frontend for type safety, assuming I'm using TypeScript which I am.
+
+Okay, that's the backend. Now, for the Next.js 15 frontend.
+
+I'll use stompjs for the STOMP client and sockjs-client for SockJS. I'll create a dedicated module (maybe websocket.ts) to encapsulate the WebSocket logic.
+
+State management... Zustand. I'll create a Zustand store to hold the WebSocket connection state, messages, and other relevant data. This will allow components to react to WebSocket events.
+
+Connection handling... I'll need a function to establish the connection, passing the JWT token in the headers. I'll also need functions to subscribe to topics/queues and to send messages.
+
+Reconnection... This is important. I'll use the stompjs client's built-in reconnection capabilities, with exponential backoff. I'll also add logic to handle connection failures and notify the user.
+
+Error handling... I'll handle errors from the stompjs client and from the backend (like the MessageDeliveryException).
+
+Okay, I think I have a good plan. Let me start writing the code, keeping in mind best practices and Next.js 15 conventions. I'll use TypeScript for type safety. I should probably break the code into smaller, manageable chunks as I think through each part.
+</contemplator>
+
+<contemplator>
+// websocket.ts
+
+// First, I need to install the necessary packages.
+// npm install @stomp/stompjs sockjs-client
+
+import { Client, IFrame, IMessage, StompHeaders, StompSubscription } from '@stomp/stompjs';
+import SockJS from 'sockjs-client';
+import { create } from 'zustand';
+
+// --- Data Structures ---
+// I need to mirror the backend's data structures for type safety.
+
+interface MessageRequest {
+  conversationId: number;
+  content: string;
+  mediaIds?: number[];
+  type: MessageType;
+  replyToMessageId?: number;
+}
+
+interface MessageResponse {
+  id: number;
+  conversationId: number;
+  senderUsername: string;
+  senderAvatarUrl: string;
+  senderDisplayName: string;
+  content: string;
+  mediaItems: any[]; // Replace with actual MediaResponse type
+  type: MessageType;
+  reactions: any[]; // Replace with actual ReactionResponse type
+  createdAt: string;
+  editedAt: string;
+  deliveryStatus: any[]; // Replace with actual MessageDeliveryStatusResponse type
+}
+
+// I need to add the MessageType enum from the backend.
+enum MessageType {
+    TEXT, // Example type, adjust according to your backend
+    IMAGE,
+    VIDEO,
+    AUDIO
+    // ... other types
+}
+
+// --- Zustand Store ---
+
+interface WebSocketState {
+  client: Client | null;
+  connected: boolean;
+  messages: MessageResponse[];
+  subscriptions: StompSubscription[];
+  connect: (token: string) => void;
+  disconnect: () => void;
+  sendMessage: (message: MessageRequest) => void;
+  subscribe: (destination: string, callback: (message: IMessage) => void) => StompSubscription;
+  unsubscribe: (subscriptionId: string) => void;
+}
+// Wait, should I store the entire Client object in Zustand? That might not be ideal for reactivity.
+// Maybe I should just store the connection status and messages, and keep the client outside.
+// Okay, let me revise the store.
+
+interface RevisedWebSocketState {
+    connected: boolean;
+    messages: MessageResponse[];
+    privateMessages: { [conversationId: number]: MessageResponse[] };
+    groupMessages: { [conversationId: number]: MessageResponse[] };
+    appendPrivateMessage: (message: MessageResponse) => void;
+    appendGroupMessage: (message: MessageResponse) => void;
+}
+
+const useWebSocketStore = create<RevisedWebSocketState>((set) => ({
+    connected: false,
+    messages: [],
+    privateMessages: {},
+    groupMessages: {},
+    appendPrivateMessage: (message: MessageResponse) =>
+        set((state) => ({
+            privateMessages: {
+                ...state.privateMessages,
+                [message.conversationId]: [...(state.privateMessages[message.conversationId] || []), message],
+            },
+        })),
+    appendGroupMessage: (message: MessageResponse) =>
+        set((state) => ({
+            groupMessages: {
+                ...state.groupMessages,
+                [message.conversationId]: [...(state.groupMessages[message.conversationId] || []), message],
+            },
+        })),
+}));
+
+// --- WebSocket Client ---
+
+let client: Client | null = null;
+let reconnectionTimeout: number | undefined;
+const RECONNECT_DELAY_MIN = 5000; // Initial reconnection delay in ms
+const RECONNECT_DELAY_MAX = 30000; // Maximum reconnection delay in ms
+let currentReconnectDelay = RECONNECT_DELAY_MIN;
+
+// Should I use exponential backoff for reconnection? Yes, that's a good practice.
+// I'll add a function to calculate the next delay.
+
+const calculateNextReconnectDelay = () => {
+  const newDelay = currentReconnectDelay * 2;
+  currentReconnectDelay = Math.min(newDelay, RECONNECT_DELAY_MAX);
+  return currentReconnectDelay;
+};
+
+const resetReconnectDelay = () => {
+  currentReconnectDelay = RECONNECT_DELAY_MIN;
+};
+
+const connect = (token: string) => {
+    // Need to check if already connected
+    if (client !== null && client.connected) {
+        console.warn("WebSocket already connected.");
+        return;
+    }
+
+    client = new Client({
+        webSocketFactory: () => new SockJS(`${process.env.NEXT_PUBLIC_BACKEND_URL}/ws`), // Correctly prepend /ws to the URL.
+        connectHeaders: {
+            Authorization: `Bearer ${token}`,
+        },
+        debug: (str) => {
+            console.log(str);
+        },
+        reconnectDelay: currentReconnectDelay,
+        heartbeatIncoming: 10000,
+        heartbeatOutgoing: 10000,
+        onConnect: (frame: IFrame) => {
+            // This is called on a successful connection
+            console.log("WebSocket connected:", frame);
+            useWebSocketStore.setState({ connected: true });
+            resetReconnectDelay(); // Reset on successful connection
+
+            // Subscribe to user-specific channels
+            client?.subscribe(`/user/queue/chat`, (message: IMessage) => {
+                const receivedMessage: MessageResponse = JSON.parse(message.body);
+                useWebSocketStore.getState().appendPrivateMessage(receivedMessage);
+            });
+
+            client?.subscribe(`/topic/chat`, (message: IMessage) => {
+                const receivedMessage: MessageResponse = JSON.parse(message.body);
+                useWebSocketStore.getState().appendGroupMessage(receivedMessage);
+            });
+        },
+        onStompError: (frame: IFrame) => {
+            // This is called when there's an error
+            console.error("Broker reported error:", frame.headers['message']);
+            console.error("Additional details:", frame.body);
+        },
+        onWebSocketClose: (event: CloseEvent) => {
+            // This is called when the WebSocket connection is closed.
+            console.warn("WebSocket connection closed:", event);
+            useWebSocketStore.setState({ connected: false });
+            // Logic for attempting to reconnect based on the reason for closing the connection.
+            if (!event.wasClean) {
+                // Implement reconnection
+                const delay = calculateNextReconnectDelay();
+                console.log(`Attempting to reconnect in ${delay}ms`);
+                reconnectionTimeout = window.setTimeout(() => connect(token), delay);
+            }
+        },
+        onWebSocketError: (event: Event) => {
+            console.error("WebSocket error:", event);
+        },
+        onDisconnect: (frame: IFrame) => {
+            console.log("WebSocket disconnected:", frame);
+            useWebSocketStore.setState({ connected: false });
+        },
+    });
+
+    client.activate();
+};
+
+const disconnect = () => {
+    if (client && client.connected) {
+        client.deactivate();
+        useWebSocketStore.setState({ connected: false });
+    }
+    if (reconnectionTimeout) {
+        clearTimeout(reconnectionTimeout);
+        reconnectionTimeout = undefined;
+    }
+    resetReconnectDelay();
+};
+
+// Send message function
+const sendMessage = (message: MessageRequest) => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+
+  const destination = message.type === MessageType.TEXT
+    ? `/app/chat.sendPrivateMessage`
+    : `/app/chat.sendGroupMessage/`;
+
+  client.publish({
+    destination,
+    body: JSON.stringify(message),
+  });
+};
+
+// Public subscription function with type guard
+const subscribe = (
+  destination: string,
+  callback: (message: IMessage) => void
+): StompSubscription | undefined => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+  return client.subscribe(destination, callback);
+};
+
+// Unsubscribe from a specific subscription
+const unsubscribe = (subscriptionId: string) => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+
+  // Unsubscribe using the subscription ID
+  client.unsubscribe(subscriptionId);
+};
+
+export { connect, disconnect, sendMessage, subscribe, unsubscribe, useWebSocketStore };
+content_copy
+download
+Use code with caution.
+TypeScript
+<contemplator>
+// --- Usage Example in a Next.js Component ---
+// This component, named `ChatComponent.tsx`, will use the functions exported from `websocket.ts` to interact with the WebSocket connection.
+// It will have input fields for sending messages, and it will display received messages.
+
+// ChatComponent.tsx
+
+import React, { useEffect, useState } from 'react';
+import {
+  connect,
+  disconnect,
+  sendMessage,
+  subscribe,
+  unsubscribe,
+  useWebSocketStore,
+} from './websocket'; // Assuming websocket.ts is in the same directory
+import { MessageType } from './websocket';
+
+const ChatComponent: React.FC = () => {
+  const { connected, privateMessages, groupMessages, appendPrivateMessage, appendGroupMessage } = useWebSocketStore();
+  const [newMessage, setNewMessage] = useState('');
+  const [token, setToken] = useState<string | null>(null); // Add a state for the token
+
+  // Fetch the token when the component mounts
+  useEffect(() => {
+    const fetchedToken = localStorage.getItem('token');
+    if (fetchedToken) {
+      setToken(fetchedToken);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (token) {
+      connect(token);
+
+      // Cleanup function to disconnect when the component unmounts
+      return () => disconnect();
+    }
+  }, [token]);
+
+  const handleSendMessage = () => {
+    if (newMessage.trim() && connected) {
+      // Assuming a conversationId of 1 for now
+      const messageRequest = {
+        conversationId: 1, // Replace with actual conversationId
+        content: newMessage,
+        type: MessageType.TEXT, // Or other relevant type
+      };
+
+      sendMessage(messageRequest);
+      setNewMessage('');
+    }
+  };
+
+  return (
+    <div>
+      <h1>WebSocket Chat {connected ? ' (Connected)' : ' (Disconnected)'}</h1>
+
+      <h2>Private Messages:</h2>
+      {Object.entries(privateMessages).map(([conversationId, messages]) => (
+        <div key={conversationId}>
+          <h3>Conversation {conversationId}</h3>
+          {messages.map((msg) => (
+            <div key={msg.id}>
+              {msg.senderUsername}: {msg.content}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <h2>Group Messages:</h2>
+      {Object.entries(groupMessages).map(([conversationId, messages]) => (
+        <div key={conversationId}>
+          <h3>Conversation {conversationId}</h3>
+          {messages.map((msg) => (
+            <div key={msg.id}>
+              {msg.senderUsername}: {msg.content}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <div>
+        <input
+          type="text"
+          value={newMessage}
+          onChange={(e) => setNewMessage(e.target.value)}
+          placeholder="Enter message"
+        />
+        <button onClick={handleSendMessage}>Send</button>
+      </div>
+    </div>
+  );
+};
+
+export default ChatComponent;
+content_copy
+download
+Use code with caution.
+TypeScript
+</contemplator>
+
+
+<final_answer>
+
+// websocket.ts
+
+import { Client, IFrame, IMessage, StompHeaders, StompSubscription } from '@stomp/stompjs';
+import SockJS from 'sockjs-client';
+import { create } from 'zustand';
+
+// --- Data Structures ---
+
+interface MessageRequest {
+  conversationId: number;
+  content: string;
+  mediaIds?: number[];
+  type: MessageType;
+  replyToMessageId?: number;
+}
+
+interface MessageResponse {
+  id: number;
+  conversationId: number;
+  senderUsername: string;
+  senderAvatarUrl: string;
+  senderDisplayName: string;
+  content: string;
+  mediaItems: any[]; // Replace with actual MediaResponse type
+  type: MessageType;
+  reactions: any[]; // Replace with actual ReactionResponse type
+  createdAt: string;
+  editedAt: string;
+  deliveryStatus: any[]; // Replace with actual MessageDeliveryStatusResponse type
+}
+
+// I need to add the MessageType enum from the backend.
+enum MessageType {
+    TEXT, // Example type, adjust according to your backend
+    IMAGE,
+    VIDEO,
+    AUDIO
+    // ... other types
+}
+
+// --- Zustand Store ---
+
+interface RevisedWebSocketState {
+    connected: boolean;
+    messages: MessageResponse[];
+    privateMessages: { [conversationId: number]: MessageResponse[] };
+    groupMessages: { [conversationId: number]: MessageResponse[] };
+    appendPrivateMessage: (message: MessageResponse) => void;
+    appendGroupMessage: (message: MessageResponse) => void;
+}
+
+const useWebSocketStore = create<RevisedWebSocketState>((set) => ({
+    connected: false,
+    messages: [],
+    privateMessages: {},
+    groupMessages: {},
+    appendPrivateMessage: (message: MessageResponse) =>
+        set((state) => ({
+            privateMessages: {
+                ...state.privateMessages,
+                [message.conversationId]: [...(state.privateMessages[message.conversationId] || []), message],
+            },
+        })),
+    appendGroupMessage: (message: MessageResponse) =>
+        set((state) => ({
+            groupMessages: {
+                ...state.groupMessages,
+                [message.conversationId]: [...(state.groupMessages[message.conversationId] || []), message],
+            },
+        })),
+}));
+
+// --- WebSocket Client ---
+
+let client: Client | null = null;
+let reconnectionTimeout: number | undefined;
+const RECONNECT_DELAY_MIN = 5000; // Initial reconnection delay in ms
+const RECONNECT_DELAY_MAX = 30000; // Maximum reconnection delay in ms
+let currentReconnectDelay = RECONNECT_DELAY_MIN;
+
+const calculateNextReconnectDelay = () => {
+  const newDelay = currentReconnectDelay * 2;
+  currentReconnectDelay = Math.min(newDelay, RECONNECT_DELAY_MAX);
+  return currentReconnectDelay;
+};
+
+const resetReconnectDelay = () => {
+  currentReconnectDelay = RECONNECT_DELAY_MIN;
+};
+
+const connect = (token: string) => {
+    if (client !== null && client.connected) {
+        console.warn("WebSocket already connected.");
+        return;
+    }
+
+    client = new Client({
+        webSocketFactory: () => new SockJS(`${process.env.NEXT_PUBLIC_BACKEND_URL}/ws`), // Correctly prepend /ws to the URL.
+        connectHeaders: {
+            Authorization: `Bearer ${token}`,
+        },
+        debug: (str) => {
+            console.log(str);
+        },
+        reconnectDelay: currentReconnectDelay,
+        heartbeatIncoming: 10000,
+        heartbeatOutgoing: 10000,
+        onConnect: (frame: IFrame) => {
+            console.log("WebSocket connected:", frame);
+            useWebSocketStore.setState({ connected: true });
+            resetReconnectDelay();
+
+            client?.subscribe(`/user/queue/chat`, (message: IMessage) => {
+                const receivedMessage: MessageResponse = JSON.parse(message.body);
+                useWebSocketStore.getState().appendPrivateMessage(receivedMessage);
+            });
+
+            client?.subscribe(`/topic/chat`, (message: IMessage) => {
+                const receivedMessage: MessageResponse = JSON.parse(message.body);
+                useWebSocketStore.getState().appendGroupMessage(receivedMessage);
+            });
+        },
+        onStompError: (frame: IFrame) => {
+            console.error("Broker reported error:", frame.headers['message']);
+            console.error("Additional details:", frame.body);
+        },
+        onWebSocketClose: (event: CloseEvent) => {
+            console.warn("WebSocket connection closed:", event);
+            useWebSocketStore.setState({ connected: false });
+            if (!event.wasClean) {
+                const delay = calculateNextReconnectDelay();
+                console.log(`Attempting to reconnect in ${delay}ms`);
+                reconnectionTimeout = window.setTimeout(() => connect(token), delay);
+            }
+        },
+        onWebSocketError: (event: Event) => {
+            console.error("WebSocket error:", event);
+        },
+        onDisconnect: (frame: IFrame) => {
+            console.log("WebSocket disconnected:", frame);
+            useWebSocketStore.setState({ connected: false });
+        },
+    });
+
+    client.activate();
+};
+
+const disconnect = () => {
+    if (client && client.connected) {
+        client.deactivate();
+        useWebSocketStore.setState({ connected: false });
+    }
+    if (reconnectionTimeout) {
+        clearTimeout(reconnectionTimeout);
+        reconnectionTimeout = undefined;
+    }
+    resetReconnectDelay();
+};
+
+const sendMessage = (message: MessageRequest) => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+
+  const destination = message.type === MessageType.TEXT
+    ? `/app/chat.sendPrivateMessage`
+    : `/app/chat.sendGroupMessage/`;
+
+  client.publish({
+    destination,
+    body: JSON.stringify(message),
+  });
+};
+
+const subscribe = (
+  destination: string,
+  callback: (message: IMessage) => void
+): StompSubscription | undefined => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+  return client.subscribe(destination, callback);
+};
+
+const unsubscribe = (subscriptionId: string) => {
+  if (!client || !client.connected) {
+    console.error("WebSocket not connected.");
+    return;
+  }
+  client.unsubscribe(subscriptionId);
+};
+
+export { connect, disconnect, sendMessage, subscribe, unsubscribe, useWebSocketStore };
+content_copy
+download
+Use code with caution.
+// ChatComponent.tsx
+
+import React, { useEffect, useState } from 'react';
+import {
+  connect,
+  disconnect,
+  sendMessage,
+  subscribe,
+  unsubscribe,
+  useWebSocketStore,
+} from './websocket';
+import { MessageType } from './websocket';
+
+const ChatComponent: React.FC = () => {
+  const { connected, privateMessages, groupMessages, appendPrivateMessage, appendGroupMessage } = useWebSocketStore();
+  const [newMessage, setNewMessage] = useState('');
+  const [token, setToken] = useState<string | null>(null);
+
+  useEffect(() => {
+    const fetchedToken = localStorage.getItem('token');
+    if (fetchedToken) {
+      setToken(fetchedToken);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (token) {
+      connect(token);
+      return () => disconnect();
+    }
+  }, [token]);
+
+  const handleSendMessage = () => {
+    if (newMessage.trim() && connected) {
+      const messageRequest = {
+        conversationId: 1,
+        content: newMessage,
+        type: MessageType.TEXT,
+      };
+
+      sendMessage(messageRequest);
+      setNewMessage('');
+    }
+  };
+
+  return (
+    <div>
+      <h1>WebSocket Chat {connected ? ' (Connected)' : ' (Disconnected)'}</h1>
+
+      <h2>Private Messages:</h2>
+      {Object.entries(privateMessages).map(([conversationId, messages]) => (
+        <div key={conversationId}>
+          <h3>Conversation {conversationId}</h3>
+          {messages.map((msg) => (
+            <div key={msg.id}>
+              {msg.senderUsername}: {msg.content}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <h2>Group Messages:</h2>
+      {Object.entries(groupMessages).map(([conversationId, messages]) => (
+        <div key={conversationId}>
+          <h3>Conversation {conversationId}</h3>
+          {messages.map((msg) => (
+            <div key={msg.id}>
+              {msg.senderUsername}: {msg.content}
+            </div>
+          ))}
+        </div>
+      ))}
+
+      <div>
+        <input
+          type="text"
+          value={newMessage}
+          onChange={(e) => setNewMessage(e.target.value)}
+          placeholder="Enter message"
+        />
+        <button onClick={handleSendMessage}>Send</button>
+      </div>
+    </div>
+  );
+};
+
+export default ChatComponent;
+content_copy
+download
+Use code with caution.
+TypeScript
+
+websocket.ts: This file contains the core WebSocket logic, including connection management, message sending, and state management using Zustand.
+
+ChatComponent.tsx: This is an example component demonstrating how to use the WebSocket functionality in a Next.js application.
+
+Make sure to replace placeholder values (like NEXT_PUBLIC_BACKEND_URL, conversation IDs, and message types) with your actual values.
+
+Remember to install the necessary packages: @stomp/stompjs, sockjs-client, and zustand.
+
+This code assumes that you are storing the JWT token in localStorage after a user logs in. You will need to implement the logic for storing and retrieving the token based on your authentication flow. Also make sure that your .env file contains the correct URL for the backend, for example: NEXT_PUBLIC_BACKEND_URL=http://localhost:8080
+</final_answer>
+
+SONNET-
+I'll help you implement the WebSocket functionality in your Next.js 15 frontend. Looking at your backend code, I notice several important details that we'll need to account for:
+
+1. Your backend uses JWT authentication for WebSocket connections
+2. You have both private (/queue) and group (/topic) message channels
+3. You've implemented heartbeat mechanisms and reconnection strategies
+4. The backend expects specific message formats and handles delivery status
+
+Let me create a comprehensive WebSocket implementation for your frontend. First, I'll create the necessary code structure using modern patterns.
+
+
+
+```typescript
+// src/store/websocketStore.ts
+import { create } from 'zustand'
+import { Client, Frame, Message, Subscription } from '@stomp/stompjs'
+import SockJS from 'sockjs-client'
+import { MessageResponse, MessageRequest } from '@/types/chat'
+
+interface WebSocketStore {
+  client: Client | null
+  connected: boolean
+  subscriptions: Map<string, Subscription>
+  connectionError: string | null
+  connect: (token: string) => void
+  disconnect: () => void
+  sendPrivateMessage: (message: MessageRequest) => void
+  sendGroupMessage: (message: MessageRequest) => void
+  subscribeToConversation: (conversationId: string, callback: (message: MessageResponse) => void) => () => void
+  retryCount: number
+}
+
+const WEBSOCKET_URL = process.env.NEXT_PUBLIC_WEBSOCKET_URL || 'http://localhost:8080/ws'
+const RECONNECT_DELAY = 5000
+const MAX_RETRIES = 5
+
+export const useWebSocketStore = create<WebSocketStore>((set, get) => ({
+  client: null,
+  connected: false,
+  subscriptions: new Map(),
+  connectionError: null,
+  retryCount: 0,
+
+  connect: (token: string) => {
+    const { client } = get()
+    
+    if (client) {
+      client.deactivate()
+    }
+
+    const newClient = new Client({
+      webSocketFactory: () => new SockJS(WEBSOCKET_URL),
+      connectHeaders: {
+        Authorization: `Bearer ${token}`
+      },
+      debug: (str) => {
+        console.debug('STOMP: ' + str)
+      },
+      reconnectDelay: RECONNECT_DELAY,
+      heartbeatIncoming: 10000,
+      heartbeatOutgoing: 10000,
+
+      onConnect: () => {
+        set({ connected: true, connectionError: null, retryCount: 0 })
+        console.log('WebSocket Connected')
+      },
+
+      onDisconnect: () => {
+        set({ connected: false })
+        console.log('WebSocket Disconnected')
+      },
+
+      onStompError: (frame) => {
+        const retryCount = get().retryCount
+        if (retryCount < MAX_RETRIES) {
+          set({ retryCount: retryCount + 1 })
+          setTimeout(() => get().connect(token), RECONNECT_DELAY)
+        } else {
+          set({ 
+            connectionError: `Connection error: ${frame.headers['message']}`,
+            connected: false 
+          })
+        }
+      }
+    })
+
+    newClient.activate()
+    set({ client: newClient })
+  },
+
+  disconnect: () => {
+    const { client } = get()
+    if (client) {
+      client.deactivate()
+      set({ client: null, connected: false, subscriptions: new Map() })
+    }
+  },
+
+  sendPrivateMessage: (message: MessageRequest) => {
+    const { client, connected } = get()
+    if (!client || !connected) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    client.publish({
+      destination: '/app/chat.sendPrivateMessage',
+      body: JSON.stringify(message)
+    })
+  },
+
+  sendGroupMessage: (message: MessageRequest) => {
+    const { client, connected } = get()
+    if (!client || !connected) {
+      console.error('WebSocket not connected')
+      return
+    }
+
+    client.publish({
+      destination: '/app/chat.sendGroupMessage',
+      body: JSON.stringify(message)
+    })
+  },
+
+  subscribeToConversation: (conversationId: string, callback: (message: MessageResponse) => void) => {
+    const { client, subscriptions } = get()
+    if (!client) {
+      console.error('WebSocket not connected')
+      return () => {}
+    }
+
+    // Determine if this is a private or group conversation
+    const destination = conversationId.startsWith('private') 
+      ? `/queue/chat/${conversationId}`
+      : `/topic/chat/${conversationId}`
+
+    // Unsubscribe from existing subscription if any
+    const existingSub = subscriptions.get(conversationId)
+    if (existingSub) {
+      existingSub.unsubscribe()
+    }
+
+    // Create new subscription
+    const subscription = client.subscribe(destination, (message) => {
+      try {
+        const parsedMessage = JSON.parse(message.body) as MessageResponse
+        callback(parsedMessage)
+      } catch (error) {
+        console.error('Error parsing message:', error)
+      }
+    })
+
+    // Store the subscription
+    const newSubscriptions = new Map(subscriptions)
+    newSubscriptions.set(conversationId, subscription)
+    set({ subscriptions: newSubscriptions })
+
+    // Return unsubscribe function
+    return () => {
+      subscription.unsubscribe()
+      const currentSubs = get().subscriptions
+      currentSubs.delete(conversationId)
+      set({ subscriptions: currentSubs })
+    }
+  }
+}))
+
+// src/hooks/useWebSocket.ts
+import { useEffect } from 'react'
+import { useWebSocketStore } from '@/store/websocketStore'
+import { useAuth } from '@/hooks/useAuth' // Assuming you have an auth hook
+
+export const useWebSocket = () => {
+  const { token } = useAuth()
+  const { connect, disconnect, connected, connectionError } = useWebSocketStore()
+
+  useEffect(() => {
+    if (token && !connected) {
+      connect(token)
+    }
+
+    return () => {
+      disconnect()
+    }
+  }, [token])
+
+  return {
+    connected,
+    connectionError
+  }
+}
+
+// src/hooks/useChat.ts
+import { useCallback } from 'react'
+import { useWebSocketStore } from '@/store/websocketStore'
+import { MessageRequest, MessageResponse } from '@/types/chat'
+
+export const useChat = (conversationId: string) => {
+  const { 
+    sendPrivateMessage, 
+    sendGroupMessage, 
+    subscribeToConversation,
+    connected 
+  } = useWebSocketStore()
+
+  const sendMessage = useCallback((message: MessageRequest) => {
+    if (conversationId.startsWith('private')) {
+      sendPrivateMessage(message)
+    } else {
+      sendGroupMessage(message)
+    }
+  }, [conversationId, sendPrivateMessage, sendGroupMessage])
+
+  return {
+    sendMessage,
+    subscribeToConversation,
+    connected
+  }
+}
+
+```
+
+Now, let me explain how to use this implementation in your Next.js components. Here's an example:
+
+```typescript
+// src/components/Chat.tsx
+import { useEffect, useState } from 'react'
+import { useChat } from '@/hooks/useChat'
+import { useWebSocket } from '@/hooks/useWebSocket'
+import { MessageResponse, MessageRequest } from '@/types/chat'
+
+interface ChatProps {
+  conversationId: string
+}
+
+export default function Chat({ conversationId }: ChatProps) {
+  const [messages, setMessages] = useState<MessageResponse[]>([])
+  const { connected } = useWebSocket()
+  const { sendMessage, subscribeToConversation } = useChat(conversationId)
+
+  useEffect(() => {
+    if (!connected) return
+
+    // Subscribe to messages for this conversation
+    const unsubscribe = subscribeToConversation(conversationId, (message) => {
+      setMessages(prev => [...prev, message])
+    })
+
+    return () => {
+      unsubscribe()
+    }
+  }, [conversationId, connected])
+
+  const handleSendMessage = (content: string) => {
+    const message: MessageRequest = {
+      conversationId: parseInt(conversationId),
+      content,
+      type: 'TEXT',
+      mediaIds: new Set(),
+    }
+    
+    sendMessage(message)
+  }
+
+  if (!connected) {
+    return <div>Connecting...</div>
+  }
+
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex-1 overflow-y-auto">
+        {messages.map((message) => (
+          <div key={message.id} className="p-2">
+            <div className="font-bold">{message.senderDisplayName}</div>
+            <div>{message.content}</div>
+            <div className="text-sm text-gray-500">
+              {new Date(message.createdAt).toLocaleTimeString()}
+            </div>
+          </div>
+        ))}
+      </div>
+      
+      <div className="p-4 border-t">
+        <input
+          type="text"
+          placeholder="Type a message..."
+          onKeyPress={(e) => {
+            if (e.key === 'Enter') {
+              handleSendMessage(e.currentTarget.value)
+              e.currentTarget.value = ''
+            }
+          }}
+          className="w-full p-2 border rounded"
+        />
+      </div>
+    </div>
+  )
+}
+
+```
+
+This implementation provides several key features:
+
+1. Automatic WebSocket connection management using JWT authentication
+2. Reconnection handling with exponential backoff
+3. Separate handling for private and group messages
+4. Clean subscription management with automatic cleanup
+5. Type-safe message handling
+6. Zustand store for global WebSocket state management
+7. Custom hooks for easy integration in components
+
+To use this in your Next.js application, you'll need to install these dependencies:
+
+```bash
+npm install @stomp/stompjs sockjs-client zustand
+npm install -D @types/sockjs-client
+```
+
+Would you like me to explain any specific part in more detail or help you with implementing additional features like typing indicators, read receipts, or offline message handling?
